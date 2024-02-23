@@ -1957,6 +1957,7 @@ dependencies = [
  "error_handling",
  "framing_sv2",
  "futures",
+ "jsonrpc",
  "key-utils",
  "network_helpers",
  "once_cell",

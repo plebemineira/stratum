@@ -4,7 +4,8 @@ mod lib;
 
 use args::Args;
 use error::{Error, ProxyResult};
-use lib::{downstream_sv1, error, proxy, proxy_config, status, upstream_sv2};
+use lib::{downstream_sv1, error, proxy, proxy_config, status, upstream_sv2, rpc_client};
+use lib::rpc_client::RpcApi;
 use proxy_config::ProxyConfig;
 use roles_logic_sv2::utils::Mutex;
 
@@ -18,6 +19,8 @@ use std::{
 
 use tokio::{sync::broadcast, task};
 use v1::server_to_client;
+
+use stratum_common::bitcoin::{blockdata::transaction::Transaction, consensus::Decodable};
 
 use crate::status::{State, Status};
 use tracing::{debug, error, info};
@@ -77,6 +80,15 @@ async fn main() {
         broadcast::Receiver<server_to_client::Notify>,
     ) = broadcast::channel(10);
 
+    // const hashrate_time: u16 = 1; // minutes
+    // const deposit_address
+    // // let buyer_address;
+    // //
+    // // // we want to modify this so it becomes dynamic!
+    // // if payment_made {
+    // //     upstream_addr = pool_chosen_by_client;
+    // // }
+
     // Format `Upstream` connection address
     let upstream_addr = SocketAddr::new(
         IpAddr::from_str(&proxy_config.upstream_address)
@@ -107,6 +119,14 @@ async fn main() {
             return;
         }
     };
+
+    let txid = "b6d882a9585f9d545032d0972f2ae0a41534e91a4d8d638f7803dc6c958f1636".to_string();
+
+    let rpc_client = rpc_client::RpcClient::new("http://127.0.0.1:18443", rpc_client::Auth::UserPass("username".to_string(), "password".to_string())).unwrap();
+    let check_deposit = rpc_client.get_raw_transaction(&txid, None).unwrap();
+
+    // todo: some logic to check deposit value + script
+    println!("aaaaaa {:?}", check_deposit);
 
     // Spawn a task to do all of this init work so that the main thread
     // can listen for signals and failures on the status channel. This
