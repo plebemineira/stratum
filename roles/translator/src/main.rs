@@ -1,16 +1,18 @@
 #![allow(special_module_name)]
 mod args;
+mod json_rpc;
 mod lib;
 
 use args::Args;
 use error::{Error, ProxyResult};
-use lib::{downstream_sv1, error, proxy, proxy_config, status, upstream_sv2, rpc_client};
 use lib::rpc_client::RpcApi;
+use lib::{downstream_sv1, error, proxy, proxy_config, rpc_client, status, upstream_sv2};
 use proxy_config::ProxyConfig;
 use roles_logic_sv2::utils::Mutex;
 
 use async_channel::{bounded, unbounded};
 use futures::{select, FutureExt};
+use tokio::sync::mpsc;
 use std::{
     net::{IpAddr, SocketAddr},
     str::FromStr,
@@ -19,7 +21,7 @@ use std::{
 
 use tokio::{sync::broadcast, task};
 use v1::server_to_client;
-
+use json_rpc::run_http_server;
 use stratum_common::bitcoin::{blockdata::transaction::Transaction, consensus::Decodable};
 
 use crate::status::{State, Status};
@@ -73,7 +75,10 @@ async fn main() {
     // (Sender<ExtendedExtranonce>, Receiver<ExtendedExtranonce>)
     let (tx_sv2_extranonce, rx_sv2_extranonce) = bounded(1);
     let target = Arc::new(Mutex::new(vec![0; 32]));
-
+    
+    let (sender, mut recv) = mpsc::channel(10);
+    let _http = tokio::spawn(run_http_server(sender));
+    
     // Sender/Receiver to send SV1 `mining.notify` message from the `Bridge` to the `Downstream`
     let (tx_sv1_notify, _rx_sv1_notify): (
         broadcast::Sender<server_to_client::Notify>,
@@ -122,7 +127,11 @@ async fn main() {
 
     let txid = "b6d882a9585f9d545032d0972f2ae0a41534e91a4d8d638f7803dc6c958f1636".to_string();
 
-    let rpc_client = rpc_client::RpcClient::new("http://127.0.0.1:18443", rpc_client::Auth::UserPass("username".to_string(), "password".to_string())).unwrap();
+    let rpc_client = rpc_client::RpcClient::new(
+        "http://127.0.0.1:18443",
+        rpc_client::Auth::UserPass("username".to_string(), "password".to_string()),
+    )
+    .unwrap();
     let check_deposit = rpc_client.get_raw_transaction(&txid, None).unwrap();
 
     // todo: some logic to check deposit value + script
@@ -203,7 +212,7 @@ async fn main() {
             diff_config,
         );
     }); // End of init task
-
+    
     debug!("Starting up signal listener");
     let mut interrupt_signal_future = Box::pin(tokio::signal::ctrl_c().fuse());
     debug!("Starting up status listener");
