@@ -342,8 +342,14 @@ impl Upstream {
 
         task::spawn(async move {
             loop {
+                let incoming = loop {
+                    match connection.lock().await.receiver.try_recv() {
+                        Ok(incoming) => break incoming,
+                        Err(_) => tokio::time::sleep(Duration::from_secs(5)).await,
+                    }
+                };
+
                 // Waiting to receive a message from the SV2 Upstream role
-                let incoming = handle_result!(tx_status, connection.lock().await.receiver.recv().await);
                 let mut incoming: StdFrame = handle_result!(tx_status, incoming.try_into());
                 // On message receive, get the message type from the message header and get the
                 // message payload
