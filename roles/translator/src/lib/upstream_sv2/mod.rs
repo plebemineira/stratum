@@ -6,6 +6,7 @@ pub mod upstream;
 pub mod upstream_connection;
 pub use upstream::Upstream;
 pub use upstream_connection::UpstreamConnection;
+pub use super::proxy_request;
 
 pub type Message = PoolMessages<'static>;
 pub type StdFrame = StandardSv2Frame<Message>;

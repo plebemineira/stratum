@@ -1,16 +1,10 @@
-use serde::Deserialize;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::mpsc,
 };
 
-#[derive(Deserialize, Debug)]
-pub struct ProxyRequest {
-    txid: String,
-    client_upstream: String,
-    duration: u32,
-}
+use crate::lib::proxy_request::ProxyRequest;
 
 pub async fn run_http_server(notify: mpsc::Sender<ProxyRequest>) {
     let listener = TcpListener::bind("0.0.0.0:8080").await.unwrap();

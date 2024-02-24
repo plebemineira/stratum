@@ -13,12 +13,12 @@ use std::{sync::Arc, time::Duration};
 impl Upstream {
     /// this function checks if the elapsed time since the last update has surpassed the config
     pub(super) async fn try_update_hashrate(self_: Arc<Mutex<Self>>) -> ProxyResult<'static, ()> {
-        let (channel_id_option, diff_mgmt, tx_frame) = self_
+        let (channel_id_option, diff_mgmt, connection) = self_
             .safe_lock(|u| {
                 (
                     u.channel_id,
                     u.difficulty_config.clone(),
-                    u.connection.sender.clone(),
+                    u.connection.clone(),
                 )
             })
             .map_err(|_e| PoisonLock)?;
@@ -38,7 +38,7 @@ impl Upstream {
         let either_frame: StdFrame = message.try_into()?;
         let frame: EitherFrame = either_frame.into();
 
-        tx_frame.send(frame).await.map_err(|e| {
+        connection.lock().await.sender.send(frame).await.map_err(|e| {
             super::super::error::Error::ChannelErrorSender(
                 super::super::error::ChannelSendError::General(e.to_string()),
             )

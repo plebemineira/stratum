@@ -6,8 +6,11 @@ use crate::{
     },
     proxy_config::UpstreamDifficultyConfig,
     status,
-    upstream_sv2::{EitherFrame, Message, StdFrame, UpstreamConnection},
+    upstream_sv2::{EitherFrame, Message, StdFrame, UpstreamConnection}
 };
+
+use super::proxy_request::ProxyRequest;
+
 use async_channel::{Receiver, Sender};
 use async_std::{net::TcpStream, task};
 use binary_sv2::u256_from_int;
@@ -29,15 +32,15 @@ use roles_logic_sv2::{
     parsers::Mining,
     routing_logic::{CommonRoutingLogic, MiningRoutingLogic, NoRouting},
     selectors::NullDownstreamMiningSelector,
-    utils::Mutex,
     Error as RolesLogicError,
+    utils::Mutex,
     Error::NoUpstreamsConnected,
 };
 use std::{
     net::SocketAddr,
     sync::{atomic::AtomicBool, Arc},
     thread::sleep,
-    time::Duration,
+    time::Duration
 };
 use tracing::{error, info, warn};
 
@@ -67,7 +70,7 @@ pub struct Upstream {
     /// Bytes used as implicit first part of `extranonce`.
     extranonce_prefix: Option<Vec<u8>>,
     /// Represents a connection to a SV2 Upstream role.
-    pub(super) connection: UpstreamConnection,
+    pub(super) connection: Arc<tokio::sync::Mutex<UpstreamConnection>>,
     /// Receives SV2 `SubmitSharesExtended` messages translated from SV1 `mining.submit` messages.
     /// Translated by and sent from the `Bridge`.
     rx_sv2_submit_shares_ext: Receiver<SubmitSharesExtended<'static>>,
@@ -114,6 +117,7 @@ impl Upstream {
     /// from the `Downstream`.
     #[cfg_attr(feature = "cargo-clippy", allow(clippy::too_many_arguments))]
     pub async fn new(
+        mut switch_signal: tokio::sync::mpsc::Receiver<ProxyRequest>,
         address: SocketAddr,
         authority_public_key: Secp256k1PublicKey,
         rx_sv2_submit_shares_ext: Receiver<SubmitSharesExtended<'static>>,
@@ -140,7 +144,7 @@ impl Upstream {
             }
         };
 
-        let pub_key: Secp256k1PublicKey = authority_public_key;
+        let pub_key: Secp256k1PublicKey = authority_public_key.clone();
         let initiator = Initiator::from_raw_k(pub_key.into_bytes())?;
 
         info!(
@@ -155,9 +159,8 @@ impl Upstream {
         // Initialize `UpstreamConnection` with channel for SV2 Upstream role communication and
         // channel for downstream Translator Proxy communication
         let connection = UpstreamConnection { receiver, sender };
-
-        Ok(Arc::new(Mutex::new(Self {
-            connection,
+        let self_ = Arc::new(Mutex::new(Self {
+            connection: Arc::new(tokio::sync::Mutex::new(connection)),
             rx_sv2_submit_shares_ext,
             extranonce_prefix: None,
             tx_sv2_set_new_prev_hash,
@@ -171,9 +174,57 @@ impl Upstream {
             tx_status,
             target,
             difficulty_config,
-        })))
+        }));
+        
+        let pubkey_ = authority_public_key.clone();
+        let self__ = self_.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let pub_key: Secp256k1PublicKey = pubkey_.clone();
+                let initiator = Initiator::from_raw_k(pub_key.into_bytes()).unwrap();
+
+                let req = switch_signal.recv().await.unwrap();
+                Self::switch_upstream_connection(self__.clone(), req, initiator).await;
+            }
+        });
+        
+        Ok(self_)
     }
 
+    async fn switch_upstream_connection(
+        self_: Arc<Mutex<Self>>,
+        req: ProxyRequest,
+        initiator: Box<Initiator>,
+    ) {
+        let address = req.client_upstream.parse::<SocketAddr>().unwrap();
+        info!("Switching upstream to {:?}", address);
+        // Connect to the SV2 Upstream role retry connection every 5 seconds.
+        let socket = loop {
+            match TcpStream::connect(address).await {
+                Ok(socket) => break socket,
+                Err(e) => {
+                    error!(
+                        "Failed to connect to Upstream role at {}, retrying in 5s: {}",
+                        address, e
+                    );
+
+                    sleep(Duration::from_secs(5));
+                }
+            }
+        };
+
+        // Channel to send and receive messages to the SV2 Upstream role
+        let (receiver, sender) = Connection::new(socket, HandshakeRole::Initiator(initiator), 10)
+            .await
+            .unwrap();
+        // Initialize `UpstreamConnection` with channel for SV2 Upstream role communication and
+        // channel for downstream Translator Proxy communication
+        let connection = UpstreamConnection { receiver, sender };
+        let old_connection = self_.safe_lock(|s| s.connection.clone());
+        
+        std::mem::replace(&mut *old_connection.unwrap().lock().await, connection);
+    }
     /// Setups the connection with the SV2 Upstream role (most typically a SV2 Pool).
     pub async fn connect(
         self_: Arc<Mutex<Self>>,
@@ -182,7 +233,7 @@ impl Upstream {
     ) -> ProxyResult<'static, ()> {
         // Get the `SetupConnection` message with Mining Device information (currently hard coded)
         let setup_connection = Self::get_setup_connection_message(min_version, max_version, false)?;
-        let mut connection = self_
+        let connection = self_
             .safe_lock(|s| s.connection.clone())
             .map_err(|_e| PoisonLock)?;
 
@@ -190,6 +241,7 @@ impl Upstream {
         let sv2_frame: StdFrame = Message::Common(setup_connection.into()).try_into()?;
         // Send the `SetupConnection` frame to the SV2 Upstream role
         // Only one Upstream role is supported, panics if multiple connections are encountered
+        let mut connection = (*connection).lock().await;
         connection.send(sv2_frame).await?;
 
         // Wait for the SV2 Upstream to respond with either a `SetupConnectionSuccess` or a
@@ -260,20 +312,18 @@ impl Upstream {
     pub fn parse_incoming(self_: Arc<Mutex<Self>>) -> ProxyResult<'static, ()> {
         let clone = self_.clone();
         let (
-            tx_frame,
+            connection,
             tx_sv2_extranonce,
             tx_sv2_new_ext_mining_job,
             tx_sv2_set_new_prev_hash,
-            recv,
             tx_status,
         ) = clone
             .safe_lock(|s| {
                 (
-                    s.connection.sender.clone(),
+                    s.connection.clone(),
                     s.tx_sv2_extranonce.clone(),
                     s.tx_sv2_new_ext_mining_job.clone(),
                     s.tx_sv2_set_new_prev_hash.clone(),
-                    s.connection.receiver.clone(),
                     s.tx_status.clone(),
                 )
             })
@@ -293,7 +343,7 @@ impl Upstream {
         task::spawn(async move {
             loop {
                 // Waiting to receive a message from the SV2 Upstream role
-                let incoming = handle_result!(tx_status, recv.recv().await);
+                let incoming = handle_result!(tx_status, connection.lock().await.receiver.recv().await);
                 let mut incoming: StdFrame = handle_result!(tx_status, incoming.try_into());
                 // On message receive, get the message type from the message header and get the
                 // message payload
@@ -336,7 +386,7 @@ impl Upstream {
                         // Relay the response message to the Upstream role
                         handle_result!(
                             tx_status,
-                            tx_frame.send(frame).await.map_err(|e| {
+                            connection.lock().await.sender.send(frame).await.map_err(|e| {
                                 super::super::error::Error::ChannelErrorSender(
                                     super::super::error::ChannelSendError::General(e.to_string()),
                                 )
@@ -460,10 +510,10 @@ impl Upstream {
     #[allow(clippy::result_large_err)]
     pub fn handle_submit(self_: Arc<Mutex<Self>>) -> ProxyResult<'static, ()> {
         let clone = self_.clone();
-        let (tx_frame, receiver, tx_status) = clone
+        let (connection, receiver, tx_status) = clone
             .safe_lock(|s| {
                 (
-                    s.connection.sender.clone(),
+                    s.connection.clone(),
                     s.rx_sv2_submit_shares_ext.clone(),
                     s.tx_status.clone(),
                 )
@@ -498,7 +548,7 @@ impl Upstream {
                 let frame: EitherFrame = frame.into();
                 handle_result!(
                     tx_status,
-                    tx_frame.send(frame).await.map_err(|e| {
+                    connection.lock().await.sender.send(frame).await.map_err(|e| {
                         super::super::error::Error::ChannelErrorSender(
                             super::super::error::ChannelSendError::General(e.to_string()),
                         )

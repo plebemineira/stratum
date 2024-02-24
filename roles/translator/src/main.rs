@@ -1,6 +1,6 @@
 #![allow(special_module_name)]
 mod args;
-mod json_rpc;
+pub mod json_rpc;
 mod lib;
 
 use args::Args;
@@ -22,7 +22,6 @@ use std::{
 use tokio::{sync::broadcast, task};
 use v1::server_to_client;
 use json_rpc::run_http_server;
-use stratum_common::bitcoin::{blockdata::transaction::Transaction, consensus::Decodable};
 
 use crate::status::{State, Status};
 use tracing::{debug, error, info};
@@ -105,6 +104,7 @@ async fn main() {
 
     // Instantiate a new `Upstream` (SV2 Pool)
     let upstream = match upstream_sv2::Upstream::new(
+        recv,
         upstream_addr,
         proxy_config.upstream_authority_pubkey,
         rx_sv2_submit_shares_ext,
